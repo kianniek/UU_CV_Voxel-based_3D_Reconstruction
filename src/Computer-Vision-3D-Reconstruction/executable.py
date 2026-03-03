@@ -18,22 +18,19 @@ firstTime = True
 window_width, window_height = config['window_width'], config['window_height']
 camera = Camera(glm.vec3(0, 100, 0), pitch=-90, yaw=0, speed=40)
 
-# ── Debug overlay state ────────────────────────────────────────────────────────
-_debug_cam_index = -1          # -1 = free camera, 0-3 = snapped to cam 1-4
-_debug_overlay_window = None   # name of the cv2 window (or None)
+_debug_cam_index = -1
+_debug_overlay_window = None
 
-# ── H-key sequential demo state ─────────────────────────────────────────────
-_seq_active      = False       # True while the sequence is running
-_seq_cam_index   = 0           # which camera is currently shown (0-3)
-_seq_next_time   = 0.0         # glfw time when next camera should trigger
-_seq_mode        = 'union'     # 'union' for H, 'intersect' for J
-_SEQ_DELAY       = 5.0        # seconds between cameras
+_seq_active = False
+_seq_cam_index = 0
+_seq_next_time = 0.0
+_seq_mode = 'union'
+_SEQ_DELAY = 5.0
 
-# ── Spacebar playback state ─────────────────────────────────────────────────
-_playback_active    = False    # True while spacebar playback is running
-_playback_next_time = 0.0     # glfw time for next frame
-_PLAYBACK_FPS       = 30.0    # target frames per second
-_g_pressed_once     = False   # G must be pressed at least once before playback
+_playback_active = False
+_playback_next_time = 0.0
+_PLAYBACK_FPS = 30.0
+_g_pressed_once = False
 
 
 def draw_objs(obj, program, perspective, light_pos, texture, normal, specular, depth):
@@ -157,11 +154,9 @@ def main():
 
         move_input(window, delta_time)
 
-        # ── H-key sequential demo tick ───────────────────────────────────
         if _seq_active and current_time >= _seq_next_time:
             _seq_advance()
 
-        # ── Spacebar playback tick (target ~30 fps) ──────────────────────
         if _playback_active and current_time >= _playback_next_time:
             _playback_tick()
 
@@ -214,21 +209,18 @@ def _snap_camera_to(cam_idx):
     pos, fwd, mask, frame = get_debug_cam_info(cam_idx)
     camera.position = pos
 
-    #  Derive pitch & yaw from the forward vector so Camera.update_vectors works
-    camera.yaw   = math.degrees(math.atan2(fwd.z, fwd.x))
+    camera.yaw = math.degrees(math.atan2(fwd.z, fwd.x))
     camera.pitch = math.degrees(math.asin(max(-1.0, min(1.0, fwd.y))))
     camera.update_vectors()
 
     _debug_cam_index = cam_idx
 
-    # Show / update the mask overlay
     win_name = f'Debug – Camera {cam_idx + 1} mask'
     if _debug_overlay_window and _debug_overlay_window != win_name:
         cv2.destroyWindow(_debug_overlay_window)
     _debug_overlay_window = win_name
 
     if mask is not None and frame is not None:
-        # Create a composite: original frame with mask tinted in green
         overlay = frame.copy()
         green = overlay.copy()
         green[:] = (0, 255, 0)
@@ -258,10 +250,10 @@ def _start_sequence(mode='union'):
     mode='intersect'  (J) – iterative carving, each step intersects one more camera.
     """
     global _seq_active, _seq_cam_index, _seq_next_time, _seq_mode
-    _seq_active    = True
+    _seq_active = True
     _seq_cam_index = 0
-    _seq_next_time = 0.0          # trigger immediately on next loop tick
-    _seq_mode      = mode
+    _seq_next_time = 0.0
+    _seq_mode = mode
     label = 'ADDITIVE (union)' if mode == 'union' else 'ITERATIVE (intersect)'
     print(f'=== Sequential camera demo started – {label} – {_SEQ_DELAY:.0f} s per step ===')
 
@@ -303,7 +295,6 @@ def _playback_tick():
         config['world_width'], config['world_height'], config['world_width'],
         debug_cam=_debug_cam_index)
     cube.set_multiple_positions(positions, colors)
-    # Refresh debug overlay if active
     if _debug_cam_index >= 0:
         _snap_camera_to(_debug_cam_index)
     _playback_next_time = glfw.get_time() + 1.0 / _PLAYBACK_FPS
@@ -317,7 +308,7 @@ def _toggle_playback():
         return
     _playback_active = not _playback_active
     if _playback_active:
-        _playback_next_time = 0.0  # start immediately
+        _playback_next_time = 0.0
         print(f'▶  Playback started ({_PLAYBACK_FPS:.0f} fps target)')
     else:
         print('⏸  Playback paused')
@@ -334,31 +325,25 @@ def key_callback(window, key, scancode, action, mods):
             config['world_width'], config['world_height'], config['world_width'],
             debug_cam=_debug_cam_index)
         cube.set_multiple_positions(positions, colors)
-        # Refresh overlay if one is active
         if _debug_cam_index >= 0:
             _snap_camera_to(_debug_cam_index)
 
-    # Press SPACE to toggle frame-by-frame playback (~30 fps)
     if key == glfw.KEY_SPACE and action == glfw.PRESS:
         _toggle_playback()
 
-    # Debug camera snap: press 1/2/3/4
     for i, k in enumerate([glfw.KEY_1, glfw.KEY_2, glfw.KEY_3, glfw.KEY_4]):
         if key == k and action == glfw.PRESS:
             _snap_camera_to(i)
             return
 
-    # Press 0 or 5 to exit debug mode and close overlay
     if key in (glfw.KEY_0, glfw.KEY_5) and action == glfw.PRESS:
         _close_debug_overlay()
         _stop_sequence()
         print('Debug overlay closed – free camera mode.')
 
-    # Press H to start additive (union) sequential demo
     if key == glfw.KEY_H and action == glfw.PRESS:
         _start_sequence(mode='union')
 
-    # Press J to start iterative (intersect) sequential demo
     if key == glfw.KEY_J and action == glfw.PRESS:
         _start_sequence(mode='intersect')
 

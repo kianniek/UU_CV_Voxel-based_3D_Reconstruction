@@ -5,10 +5,9 @@ import cv2 as cv
 import os
 
 # region Configuration
-
 block_size   = 1.2
-WORLD_SCALE  = 20 # mm per visualiser unit (fixed – defines physical model size)
-VOXEL_STEP   = 16 # mm per voxel sample   (smaller = higher resolution)
+WORLD_SCALE  = 20
+VOXEL_STEP   = 16
 CAM_IDS      = [1, 2, 3, 4]
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,8 +22,7 @@ _frame_idx    = 0
 
 # endregion
 
-# region Internal Helpers
-
+# region Helpers
 # Loads camera calibration parameters (K, dist, rvec, tvec) from each camera's config.xml and caches the result.
 def _ensure_cam_configs():
     global _cam_configs
@@ -114,8 +112,6 @@ def create_background_model_simple(cam_id):
     if not ret:
         print(f"Error reading video for camera {cam_id}")
         return None
-    
-    # Initial frame 
     base = frame.astype(np.float32)
     
     # extract frames, average them, and create a background model per camera
@@ -432,7 +428,6 @@ def get_cam_rotation_matrices():
 # endregion
 
 # region Debug Helpers
-
 _last_masks  = [None] * 4
 _last_frames = [None] * 4
 
