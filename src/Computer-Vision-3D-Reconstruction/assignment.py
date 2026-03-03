@@ -18,6 +18,7 @@ _bg_models    = None
 _lookup_table = None
 _voxel_world  = None
 _in_front     = None
+_cam_depths   = None
 _frame_idx    = 0
 
 # endregion
@@ -201,7 +202,7 @@ def optimize_thresholds(frame, manual_segmentation):
 # Builds and caches a lookup table that projects every 3D voxel to 2D pixel coordinates per camera.
 # World coords: X,Y on floor, Z<0 above floor. Visualiser coords: X,Z on floor, Y up.
 def _ensure_lut(width, height, depth):
-    global _lookup_table, _voxel_world, _in_front
+    global _lookup_table, _voxel_world, _in_front, _cam_depths
     if _lookup_table is not None:
         return _lookup_table, _voxel_world
 
@@ -224,6 +225,7 @@ def _ensure_lut(width, height, depth):
 
     _lookup_table = {}
     _in_front = {}
+    _cam_depths = {}
     for i, (K, d, rv, tv) in enumerate(cfgs):
         proj, _ = cv2.projectPoints(_voxel_world, rv, tv, K, d)
         _lookup_table[i] = proj.reshape(-1, 2)
@@ -231,6 +233,7 @@ def _ensure_lut(width, height, depth):
         R, _ = cv2.Rodrigues(rv)
         P_cam = (_voxel_world @ R.T) + tv.T
         _in_front[i] = P_cam[:, 2] > 0
+        _cam_depths[i] = P_cam[:, 2].astype(np.float64)
 
         print(f"  cam{CAM_IDS[i]} – {np.sum(_in_front[i]):,}/{N:,} in front")
 
@@ -356,10 +359,34 @@ def set_voxel_positions(width, height, depth, debug_cam=-1, debug_cams=None, deb
         fh, fw = frames[ci].shape[:2]
         ok = (px >= 0) & (px < fw) & (py >= 0) & (py < fh)
         ii = np.where(ok)[0]
-        if len(ii):
-            bgr = frames[ci][py[ii], px[ii]]
-            cs[ii] += bgr[:, ::-1] / 255.0
-            cc[ii] += 1
+        if len(ii) == 0:
+            continue
+
+        # --- Per-camera Z-buffer: only the closest voxel per pixel gets color ---
+        depths = _cam_depths[ci][aidx[ii]]
+
+        # Sort descending by depth so the closest voxels (smallest depth) are
+        # written last and overwrite farther ones in the buffer.
+        sort_order = np.argsort(-depths)
+        px_sorted = px[ii[sort_order]]
+        py_sorted = py[ii[sort_order]]
+        ii_sorted = ii[sort_order]
+
+        # Scatter local-index into an image-sized buffer (last write wins = closest)
+        idx_buffer = -np.ones((fh, fw), dtype=np.intp)
+        idx_buffer[py_sorted, px_sorted] = ii_sorted
+
+        # A voxel is visible from this camera iff it is still recorded in the
+        # buffer at the pixel it projects to.
+        visible_mask = idx_buffer[py[ii], px[ii]] == ii
+        visible = ii[visible_mask]
+
+        if len(visible) == 0:
+            continue
+
+        bgr = frames[ci][py[visible], px[visible]]
+        cs[visible] += bgr[:, ::-1] / 255.0
+        cc[visible] += 1
 
     has  = cc > 0
     cols = np.where(has[:, None], cs / np.maximum(cc[:, None], 1), 0.5)
