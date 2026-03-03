@@ -19,17 +19,17 @@
   <cols>1</cols>
   <dt>d</dt>
   <data>
-    -1.311400919513704 1.1488190586770477 1.008257178481863</data></rotation_vector>
+    -1.2063173141693342 -1.377770079701677 -1.3376104019363904</data></rotation_vector>
 <translation_vector type_id="opencv-matrix">
   <rows>3</rows>
   <cols>1</cols>
   <dt>d</dt>
   <data>
-    -142.13410193234395 1558.3359907421147 3178.3458217631414</data></translation_vector>
+    -564.71707222847715 1515.7184812935866 2284.6434557824764</data></translation_vector>
 <manual_corners type_id="opencv-matrix">
   <rows>4</rows>
   <cols>2</cols>
   <dt>f</dt>
   <data>
-    273. 398. 293. 450. 191. 457. 194. 403.</data></manual_corners>
+    191. 456. 194. 403. 274. 398. 292. 449.</data></manual_corners>
 </opencv_storage>
