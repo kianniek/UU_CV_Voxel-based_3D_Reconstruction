@@ -11,7 +11,7 @@ import os
 # region Configuration
 block_size   = 1.2
 WORLD_SCALE  = 20
-VOXEL_STEP   = 16
+VOXEL_STEP   = 14
 CAM_IDS      = [1, 2, 3, 4]
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -205,7 +205,6 @@ def optimize_thresholds(frame, mean, covar, iterations = 30):
     for i in range(iterations):
         min_weights = [MIN_WEIGHT, MIN_WEIGHT, MIN_WEIGHT] * 2
         max_weights = [MAX_WEIGHT, MAX_WEIGHT, MAX_WEIGHT * 2]
-
         weights = [np.random.uniform(min_weights[0], max_weights[0]), np.random.uniform(min_weights[1], max_weights[1]), np.random.uniform(min_weights[2], max_weights[2])]
         
         mask = get_foreground_mask(frame, mean, covar, weights, True)

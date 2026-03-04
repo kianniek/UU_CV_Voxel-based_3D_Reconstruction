@@ -32,6 +32,20 @@ _playback_next_time = 0.0
 _PLAYBACK_FPS = 30.0
 _g_pressed_once = False
 
+# ── Orbit camera mode ────────────────────────────────────────────────
+_orbit_active = False
+_orbit_angle = 0.0            # current horizontal angle (radians)
+_orbit_radius = 150.0         # distance from centre
+_orbit_speed = 0.5            # radians / second  (current, lerped)
+_orbit_speed_target = 0.5     # target after key press
+_orbit_pitch = 30.0           # elevation in degrees  (current, lerped)
+_orbit_pitch_target = 30.0    # target after key press
+_orbit_center = glm.vec3(0, 0, 0)
+_ORBIT_SPEED_STEP = 0.25      # increment per arrow press
+_ORBIT_PITCH_STEP = 10.0      # degrees per arrow press
+_ORBIT_LERP_RATE = 4.0        # how fast values approach target (per sec)
+_last_voxel_positions = None   # cached for orbit centre
+
 
 def draw_objs(obj, program, perspective, light_pos, texture, normal, specular, depth):
     program.use()
@@ -153,6 +167,7 @@ def main():
         last_time = current_time
 
         move_input(window, delta_time)
+        _orbit_update(delta_time)
 
         if _seq_active and current_time >= _seq_next_time:
             _seq_advance()
@@ -260,7 +275,7 @@ def _start_sequence(mode='union'):
 
 def _seq_advance():
     """Show voxels for cameras 0..seq_cam_index, then schedule the next."""
-    global cube, _seq_active, _seq_cam_index, _seq_next_time
+    global cube, _seq_active, _seq_cam_index, _seq_next_time, _last_voxel_positions
 
     ci = _seq_cam_index
     cams_so_far = list(range(ci + 1))
@@ -272,6 +287,7 @@ def _seq_advance():
         config['world_width'], config['world_height'], config['world_width'],
         debug_cams=cams_so_far, debug_mode=_seq_mode)
     cube.set_multiple_positions(positions, colors)
+    _last_voxel_positions = positions
     _snap_camera_to(ci)
 
     _seq_cam_index += 1
@@ -290,14 +306,76 @@ def _stop_sequence():
 
 def _playback_tick():
     """Advance to the next video frame and reconstruct voxels."""
-    global cube, _playback_next_time
+    global cube, _playback_next_time, _last_voxel_positions
     positions, colors = set_voxel_positions(
         config['world_width'], config['world_height'], config['world_width'],
         debug_cam=_debug_cam_index)
     cube.set_multiple_positions(positions, colors)
+    _last_voxel_positions = positions
     if _debug_cam_index >= 0:
         _snap_camera_to(_debug_cam_index)
     _playback_next_time = glfw.get_time() + 1.0 / _PLAYBACK_FPS
+
+
+def _toggle_orbit():
+    """Toggle orbit camera mode on/off."""
+    global _orbit_active, _orbit_angle, _orbit_center, _orbit_radius
+    global _orbit_pitch, _orbit_pitch_target, _orbit_speed, _orbit_speed_target
+    _orbit_active = not _orbit_active
+    if _orbit_active:
+        # Compute orbit centre from last generated voxel positions
+        if _last_voxel_positions and len(_last_voxel_positions) > 0:
+            pts = _last_voxel_positions
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            zs = [p[2] for p in pts]
+            _orbit_center = glm.vec3(
+                sum(xs) / len(xs),
+                sum(ys) / len(ys),
+                sum(zs) / len(zs))
+        else:
+            _orbit_center = glm.vec3(0, 0, 0)
+
+        # Derive initial angle from current camera position
+        dx = camera.position.x - _orbit_center.x
+        dz = camera.position.z - _orbit_center.z
+        _orbit_angle = math.atan2(dz, dx)
+        _orbit_radius = max(30.0, glm.length(camera.position - _orbit_center))
+        _orbit_pitch = 30.0
+        _orbit_pitch_target = 30.0
+        _orbit_speed = 0.5
+        _orbit_speed_target = 0.5
+        print(f'\U0001f504  Orbit mode ON  (centre {_orbit_center.x:.0f}, '
+              f'{_orbit_center.y:.0f}, {_orbit_center.z:.0f}  r={_orbit_radius:.0f})')
+    else:
+        print('\U0001f504  Orbit mode OFF')
+
+
+def _orbit_update(dt):
+    """Advance the orbit camera each frame (called from main loop)."""
+    global _orbit_angle, _orbit_speed, _orbit_pitch
+    if not _orbit_active:
+        return
+
+    # Lerp speed and pitch towards their targets
+    t = min(1.0, _ORBIT_LERP_RATE * dt)
+    _orbit_speed += (_orbit_speed_target - _orbit_speed) * t
+    _orbit_pitch += (_orbit_pitch_target - _orbit_pitch) * t
+
+    _orbit_angle += _orbit_speed * dt
+
+    pitch_rad = math.radians(_orbit_pitch)
+    cam_x = _orbit_center.x + _orbit_radius * math.cos(pitch_rad) * math.cos(_orbit_angle)
+    cam_y = _orbit_center.y + _orbit_radius * math.sin(pitch_rad)
+    cam_z = _orbit_center.z + _orbit_radius * math.cos(pitch_rad) * math.sin(_orbit_angle)
+
+    camera.position = glm.vec3(cam_x, cam_y, cam_z)
+
+    # Point camera at orbit centre
+    to_center = glm.normalize(_orbit_center - camera.position)
+    camera.yaw = math.degrees(math.atan2(to_center.z, to_center.x))
+    camera.pitch = math.degrees(math.asin(max(-1.0, min(1.0, to_center.y))))
+    camera.update_vectors()
 
 
 def _toggle_playback():
@@ -319,12 +397,13 @@ def key_callback(window, key, scancode, action, mods):
         _close_debug_overlay()
         glfw.set_window_should_close(window, glfw.TRUE)
     if key == glfw.KEY_G and action == glfw.PRESS:
-        global cube, _g_pressed_once
+        global cube, _g_pressed_once, _last_voxel_positions
         _g_pressed_once = True
         positions, colors = set_voxel_positions(
             config['world_width'], config['world_height'], config['world_width'],
             debug_cam=_debug_cam_index)
         cube.set_multiple_positions(positions, colors)
+        _last_voxel_positions = positions
         if _debug_cam_index >= 0:
             _snap_camera_to(_debug_cam_index)
 
@@ -341,6 +420,24 @@ def key_callback(window, key, scancode, action, mods):
         _stop_sequence()
         print('Debug overlay closed – free camera mode.')
 
+    if key == glfw.KEY_O and action == glfw.PRESS:
+        _toggle_orbit()
+
+    if _orbit_active:
+        global _orbit_speed_target, _orbit_pitch_target
+        if key == glfw.KEY_UP and action == glfw.PRESS:
+            _orbit_speed_target += _ORBIT_SPEED_STEP
+            print(f'  Orbit speed target → {_orbit_speed_target:.2f} rad/s')
+        if key == glfw.KEY_DOWN and action == glfw.PRESS:
+            _orbit_speed_target = max(0.05, _orbit_speed_target - _ORBIT_SPEED_STEP)
+            print(f'  Orbit speed target → {_orbit_speed_target:.2f} rad/s')
+        if key == glfw.KEY_RIGHT and action == glfw.PRESS:
+            _orbit_pitch_target = min(85.0, _orbit_pitch_target + _ORBIT_PITCH_STEP)
+            print(f'  Orbit pitch target → {_orbit_pitch_target:.1f}°')
+        if key == glfw.KEY_LEFT and action == glfw.PRESS:
+            _orbit_pitch_target = max(-85.0, _orbit_pitch_target - _ORBIT_PITCH_STEP)
+            print(f'  Orbit pitch target → {_orbit_pitch_target:.1f}°')
+
     if key == glfw.KEY_H and action == glfw.PRESS:
         _start_sequence(mode='union')
 
@@ -355,12 +452,15 @@ def mouse_move(win, pos_x, pos_y):
         lastPosY = pos_y
         firstTime = False
 
-    camera.rotate(pos_x - lastPosX, lastPosY - pos_y)
+    if not _orbit_active:
+        camera.rotate(pos_x - lastPosX, lastPosY - pos_y)
     lastPosX = pos_x
     lastPosY = pos_y
 
 
 def move_input(win, time):
+    if _orbit_active:
+        return
     if glfw.get_key(win, glfw.KEY_W) == glfw.PRESS:
         camera.move_top(time)
     if glfw.get_key(win, glfw.KEY_S) == glfw.PRESS:
