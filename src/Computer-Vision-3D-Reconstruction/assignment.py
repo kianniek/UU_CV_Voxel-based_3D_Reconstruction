@@ -173,25 +173,25 @@ def post_process(mask):
     kernel = cv.getStructuringElement(cv.MORPH_RECT, (3,3))
     bigger_kernel = cv.getStructuringElement(cv.MORPH_RECT, (9,9))
     
+    # Morphological Operations. 
+    
+    mask = cv.dilate(mask, kernel, iterations=3)
+
     # There's still quite a bit of noise left after morphological operations
     # Use OpenCV's function to find and label all components in image depending on the connectivity
     
-    mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel) # Erode => Dilate (remove surrounding noise)
-
-    # An extra step to remove surrounding noise that was left after Morph_Open, this is also to preserve the biggest figure (the horse)
-    blobs = cv2.connectedComponentsWithStats(mask, 8, cv.CV_32S)
+    blobs = cv2.connectedComponentsWithStats(mask, 4, cv.CV_32S)
     num, labels, stats, centroids = blobs
     biggest_blob = stats[1:, cv.CC_STAT_AREA].max() # Determine the biggest area (often the horse)
     
-
     # Go through labels, if label area is smaller than blob, set it to 0 since it is noise
     for i in range(1, num):
         if stats[i, cv.CC_STAT_AREA] < biggest_blob:
             mask[labels == i] = 0
     
-    # There are holes left in the figure itself, so with a bigger kernel, Morph_Close is performed to fill in these holes
+    mask = cv.erode(mask, kernel, iterations= 2)
     mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, bigger_kernel) # Dilate => Erode (fill in inner gaps)
-
+    
     return mask
 
 # CHOICE 2: Automated thresholding function
