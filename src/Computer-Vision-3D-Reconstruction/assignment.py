@@ -2,7 +2,11 @@ import glm
 import numpy as np
 import cv2
 import cv2 as cv
+from sklearn.mixture import GaussianMixture as gm
+from joblib import Parallel, delayed
+import time
 import os
+
 
 # region Configuration
 block_size   = 1.2
@@ -50,41 +54,14 @@ def _ensure_bg_models():
         return _bg_models
     print("Building background models …")
     for cid in CAM_IDS:
-        create_background_model_simple(cid)
+        create_background_model_mog(cid)
     _bg_models = bg_models
     return _bg_models
 
 
 # ## Task 2: Background Subtraction (Vinn)
 # Focus: HSV thresholding and morphology on `background.avi` and `video.avi`.
-#
-#
-#
-# 1. Use the background.avi files to create a background model. A single frame may not give the best results.
-#    Averaging frames may help to improve the background subtraction process somewhat. How to create the best
-#    possible background image is up to you. You can also replace this with a more sophisticated model, e.g.
-#    by modeling each pixel as a Gaussian (mixture) distribution. That will give more points.
-#
-# 2. Once a background model is made, you will be doing background subtraction on each frame of video.avi.
-#    This means you have to find all foreground pixels. Convert the foreground frame image of a given camera
-#    from BGR to HSV color space, and calculate the difference with your background model. Threshold the
-#    differences for the Hue, Saturation and Value channels. See how you combine the different channels to
-#    determine if a pixel is foreground (value 255) or background (value 0).
-#
-# 3. Setting the thresholds automatically is a choice task. Two suggestions, but there are many more viable solutions:
-#    a. Make a manual segmentation of a frame into foreground and background (e.g., in Paint). Then implement a
-#       function that finds the optimal thresholds by comparing the algorithm's output to the manual segmentation.
-#       The XOR function might be of use here. You can look over different combinations of thresholds, and simply
-#       select the combination that gave the best results.
-#    b. Assume that a good segmentation has little noise (few isolated white pixels, few isolated black pixels).
-#       Implement a function that tries out values and optimizes the amount of noise. Be creative in how you
-#       approach this. Perhaps the functions erode and dilate can help.
-#
-# 4. Also think about post-processing, e.g. using erosion and dilation. Other techniques such as Blob detection
-#    or Graph cuts (seam finding) could work. You don't need to implement these algorithms yourself, use the
-#    OpenCV API to find the relevant functions/methods. Motivate in your report why and how you use these.
-#
-#
+
 # ## Sources
 #
 # - https://en.wikipedia.org/wiki/Foreground_detection
@@ -92,111 +69,60 @@ def _ensure_bg_models():
 # - https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
 # - https://github.com/pransen/ComputerVisionAlgorithms/blob/master/GaussianMixtureModelling/README.md
 
-FRAME_RATE = 30  # Assuming a frame rate of 30 FPS for the videos
 bg_models = []
+basic_bg = []
 
-#region Helper Functions for retrieving video material
-def get_background_video(cam_id):
-    return cv.VideoCapture(os.path.join(DATA_DIR, f'cam{cam_id}', 'background.avi'))
-
-def get_video(cam_id):
-    return cv.VideoCapture(os.path.join(DATA_DIR, f'cam{cam_id}', 'video.avi'))
-#endregion
-
-# region simple background subtraction method using frame averaging
-def create_background_model_simple(cam_id):
-    """"Creates a background model for a given camera by averaging frames from the background video."""
-    
-    video = get_background_video(cam_id)
-    
-    ret, frame = video.read()
-    if not ret:
-        print(f"Error reading video for camera {cam_id}")
-        return None
-    base = frame.astype(np.float32)
-    
-    # extract frames, average them, and create a background model per camera
-    while True:
-        ret, frame = video.read()
-        if not ret:
-            break;
-        
-        cv.accumulateWeighted(frame, base, 0.01)
-    
-    bg_models.append(cv.convertScaleAbs(base))
-    
-    video.release()
-
-# endregion
-
-# region a bit more advanced bacgkround subtraction using Mixture of Gaussians 
+# region Background Modelling using a MOG method
+# source used: https://github.com/pransen/ComputerVisionAlgorithms/blob/master/GaussianMixtureModelling/README.md
 def create_background_model_mog(cam_id):
-    frame_id = 0
-    count = 0
-    
-    model = []
+    """Function that models each Pixel as a mixture of Gaussians based on HSV values"""
+    video = get_background_video(cam_id)
+
+    frames = []
     while True:
-        video = get_background_video(cam_id)
         ret, frame = video.read()
 
         # 1. Extract frames from the video.
-        # 2. Stack the frames in an array where the final array dimensions will be (num_frames, image_width, image_height, num_channels)
         if ret:
-            # grab a frame every 30 frames
-            model.append([frame_id, frame.shape[0], frame.shape[1], frame.shape[2]])
-            count += FRAME_RATE
-            video.set(cv.CAP_PROP_POS_FRAMES, count)
+            #grab the first 100 frames
+            frames.append(cv.cvtColor(frame, cv.COLOR_BGR2HSV))
+            
+            if len(frames) == 100:
+                break
         else:
             video.release()
-            break
+            return
         
-    # 3. Initialize a dummy background image of the same size as that of the individual frames.
-    base_bg = np.zeros((model[0][1], model[0][2], model[0][3]), dtype=np.float32)
+    # 2. Stack the frames in an array where the final array dimensions will be (num_frames, image_width, image_height, num_channels)
+    frame_stack = np.stack(frames, axis=0)
+    # Flatten stack to avoid nested loops
+    flat_stack = frame_stack.reshape(frame_stack.shape[0], -1, 3)
+    
+    model = []
+        
+    print("Modeling background for camera", cam_id)
+    # time_start = time.perf_counter()
     
     # 4. For each point characterized by the x-coordinate, the y-coordinate and the channel, 
-    # model the intensity value across all the frames as a mixture of two Gaussians.
-    # TODO: https://www.youtube.com/watch?v=0nz8JMyFF14 (guy explaining mixture of gaussians in a simple way)
+    # model the HSV value as a mixture of Gaussians using SciKit's GaussianMixture library.  
+    model = Parallel(n_jobs=-1)(delayed(gaussian_fit)(flat_stack[:,x,:]) 
+                                for x in range(frame_stack.shape[1] * frame_stack.shape[2]))
     
-    # so for every x, y, and channel of a pixel? we're going across all pixels?
+    # time_end = time.perf_counter()
+    # duration = time_end - time_start
+    # print("Finished modeling background for camera", cam_id, "in", duration, "seconds")
     
-    # 5. Once modelled, initialize the intensity value at the corresponding location in the dummy background image with the mean of the most weighted cluster. 
-    #       Intensity == Value in HSV?   
-    # The most weighted cluster will be the one coming from the background whereas owing to the dynamically changing and sparse nature of the foreground, the other cluster will be weighted less.
-    
-    # 6. Finally, the background image will contain the intensity values corresponding to the static background.
-
     bg_models.append(model)
 
-#create a foreground mask per camera using the background model made earlier
-def get_foreground_mask_simple(frame, bg_model, thresholds = [15, 15, 15]):
-    # TODO: BGR to HSV -> Diff -> Threshold -> Erode/Dilate
-
-    frame_hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-    bg_model_hsv = cv.cvtColor(bg_model, cv.COLOR_BGR2HSV)
-
-    # Compute absolute difference between current frame and background model in HSV space
-    frame_diff = cv.absdiff(frame_hsv, bg_model_hsv)
-    
-    # split frame into H, S, V channels and apply thresholding to S and V channels
-    # for H channel, we can ignore it for now (seems to be less susceptible to change if you see output)
-    h,s,v, = cv.split(frame_diff)
-    s_mask = cv.threshold(s, thresholds[1], 255, cv.THRESH_BINARY)[1]
-    v_mask = cv.threshold(v, thresholds[2], 255, cv.THRESH_BINARY)[1]
-    mask = cv.merge((h, s_mask, v_mask))
-    
-    mask = cv.cvtColor(cv.cvtColor(mask, cv.COLOR_HSV2BGR), cv.COLOR_BGR2GRAY)
-    mask = cv.threshold(mask, 15, 255, cv.THRESH_BINARY)[1]
-    
-    # Morphological operations to clean up the mask
-    kernel = np.ones((5,5), np.uint8)
-    mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel)
-    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
-    return mask
-
-# CHOICE 2: Automated thresholding function
-def optimize_thresholds(frame, manual_segmentation):
-    pass
+def gaussian_fit(pixel):
+    """Run SciKit's GaussianMixture.fit function with a pixel (ideally an array of its recorded HSV values)"""
+    return gm(n_components=1, covariance_type="full", reg_covar = 1).fit(pixel)
 # endregion
+
+# Model the background GMM per camera
+for id in CAM_IDS:
+    create_background_model_mog(id)
+
 
 
 # Builds and caches a lookup table that projects every 3D voxel to 2D pixel coordinates per camera.
@@ -221,7 +147,7 @@ def _ensure_lut(width, height, depth):
 
     N = len(_voxel_world)
     print(f"Building LUT: {len(xs)}×{len(ys)}×{len(zs)} = {N:,} voxels "
-          f"(step {VOXEL_STEP} mm)")
+        f"(step {VOXEL_STEP} mm)")
 
     _lookup_table = {}
     _in_front = {}
