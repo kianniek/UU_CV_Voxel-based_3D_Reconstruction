@@ -170,22 +170,31 @@ def get_foreground_mask(frame, mean, covar, thresholds = [15, 15, 15], threshold
     return mask
 
 # Post-process foreground mask to remove noise and fill gaps.
-def post_process(mask, min_area_ratio=1.0):
-    mask = cv.erode(mask, _SMALL_KERNEL, iterations=1)
-    mask = cv.dilate(mask, _MEDIUM_KERNEL, iterations=3)
+def post_process(mask):
+    # Post Processing
+    small_kernel = cv.getStructuringElement(cv.MORPH_RECT, (2,2))
+    medium_kernel = cv.getStructuringElement(cv.MORPH_RECT, (3,3))
+    bigger_kernel = cv.getStructuringElement(cv.MORPH_RECT, (9,9))
+    
+    # Morphological Operations. 
+    
+    mask = cv.erode(mask, small_kernel, iterations=1)
+    mask = cv.dilate(mask, medium_kernel, iterations=3)
 
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 4, cv.CV_32S)
+    # There's still quite a bit of noise left after morphological operations
+    # Use OpenCV's function to find and label all components in image depending on the connectivity
     
-    if num > 1:
-        areas = stats[1:, cv.CC_STAT_AREA]
-        max_area = areas.max()
-        min_area = max_area * min_area_ratio
-        
-        small_blobs = np.where(areas < min_area)[0] + 1
-        mask[np.isin(labels, small_blobs)] = 0
+    blobs = cv2.connectedComponentsWithStats(mask, 4, cv.CV_32S)
+    num, labels, stats, centroids = blobs
+    biggest_blob = stats[1:, cv.CC_STAT_AREA].max() # Determine the biggest area (often the horse)
     
-    mask = cv.erode(mask, _MEDIUM_KERNEL, iterations=2)
-    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, _BIGGER_KERNEL)
+    # Go through labels, if label area is smaller than blob, set it to 0 since it is noise
+    for i in range(1, num):
+        if stats[i, cv.CC_STAT_AREA] < biggest_blob:
+            mask[labels == i] = 0
+    
+    mask = cv.erode(mask, medium_kernel, iterations= 2)
+    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, bigger_kernel) # Dilate => Erode (fill in inner gaps)
     
     return mask 
 
