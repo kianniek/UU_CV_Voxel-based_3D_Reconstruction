@@ -170,27 +170,30 @@ def get_foreground_mask(frame, mean, covar, thresholds = [15, 15, 15], threshold
 
 def post_process(mask):
     # Post Processing
-    kernel = cv.getStructuringElement(cv.MORPH_RECT, (4,4))
+    kernel = cv.getStructuringElement(cv.MORPH_RECT, (3,3))
+    bigger_kernel = cv.getStructuringElement(cv.MORPH_RECT, (9,9))
     
-    # Morphological Operations. 
-
-
     # There's still quite a bit of noise left after morphological operations
     # Use OpenCV's function to find and label all components in image depending on the connectivity
     
-    blobs = cv2.connectedComponentsWithStats(mask, 4, cv.CV_32S)
+    mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel) # Erode => Dilate (remove surrounding noise)
+
+    # An extra step to remove surrounding noise that was left after Morph_Open, this is also to preserve the biggest figure (the horse)
+    blobs = cv2.connectedComponentsWithStats(mask, 8, cv.CV_32S)
     num, labels, stats, centroids = blobs
     biggest_blob = stats[1:, cv.CC_STAT_AREA].max() # Determine the biggest area (often the horse)
     
+
     # Go through labels, if label area is smaller than blob, set it to 0 since it is noise
     for i in range(1, num):
         if stats[i, cv.CC_STAT_AREA] < biggest_blob:
             mask[labels == i] = 0
     
-    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel) # Dilate => Erode (fill in inner gaps)
-    mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel) # Erode => Dilate (remove surrounding noise)
-    
+    # There are holes left in the figure itself, so with a bigger kernel, Morph_Close is performed to fill in these holes
+    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, bigger_kernel) # Dilate => Erode (fill in inner gaps)
+
     return mask
+
 # CHOICE 2: Automated thresholding function
 def optimize_thresholds(frame, mean, covar, iterations = 30):
     """Tries out random threshold values using the first frame as a reference. """
@@ -240,44 +243,6 @@ def unpack_gaussian_model(frame, model):
     covariance = np.reshape(covariance, (x, y, 3, 3))
     cov_inv = np.linalg.inv(covariance[:,:])
     return mean, cov_inv
-
-# region Main Code
-def subtract():
-    """Main function that runs the foreground masking process"""
-    for id in CAM_IDS:
-        video = get_video(id)
-
-        ret, frame = video.read()
-        # initialize weights
-        weight_h, weight_s, weight_v = MIN_WEIGHT, MIN_WEIGHT, MIN_WEIGHT
-        
-        if not ret:
-            print(f"Error reading video for camera {id}")
-        
-        # Try out various weight values and calculate the ideal weight based on optimal noise score    
-        mean, covar = unpack_gaussian_model(frame, bg_models[id-1])
-        weight_h, weight_s, weight_v = optimize_thresholds(frame, mean, covar)
-        
-        print(f"Optimal thresholds for camera {id-1}: H: {weight_h}, S: {weight_s}, V: {weight_v}")
-
-        while True:
-            ret, frame = video.read()
-            if not ret:
-                break
-            mask = get_foreground_mask(frame, mean, covar, [weight_h, weight_s, weight_v])
-            mask = cv.resize(mask, (frame.shape[1], frame.shape[0]))
-            
-            masked_frame = cv.bitwise_and(frame, frame, mask=mask)
-            cv.imshow(f'Camera {id-1} - Masked Frame', masked_frame)
-            
-            # if cv.waitKey(30) & 0xFF == ord('w'):
-            #     weight +=2
-                
-            if cv.waitKey(30) & 0xFF == ord('q'):
-                break
-        video.release()
-#endregion
-subtract()
 
 # Builds and caches a lookup table that projects every 3D voxel to 2D pixel coordinates per camera.
 # World coords: X,Y on floor, Z<0 above floor. Visualiser coords: X,Z on floor, Y up.
@@ -329,7 +294,7 @@ def generate_grid(width, depth):
     for x in range(width):
         for z in range(depth):
             data.append([x * block_size - width / 2,
-                         -block_size,
+                        -block_size,
                          z * block_size - depth / 2])
             colors.append([1.0, 1.0, 1.0] if (x + z) % 2 == 0 else [0, 0, 0])
     return data, colors
@@ -367,11 +332,14 @@ def set_voxel_positions(width, height, depth, debug_cam=-1, debug_cams=None, deb
         cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
         ret, fr = cap.read()
         cap.release()
-
+        
+        mean, covar = unpack_gaussian_model(fr, bgs[i])
+        thresholds = optimize_thresholds(fr, mean, covar)
         if ret and bgs[i] is not None:
             frames.append(fr)
-            masks.append(get_foreground_mask_simple(fr, bgs[i]))
+            masks.append(get_foreground_mask(fr, mean, covar, thresholds))
         else:
+
             frames.append(None)
             masks.append(np.zeros((480, 640), np.uint8))
 
@@ -485,7 +453,7 @@ def get_cam_positions():
         cfgs = _ensure_cam_configs()
     except Exception:
         return ([[-64, 64, 63], [63, 64, 63],
-                 [63, 64, -64], [-64, 64, -64]],
+                [63, 64, -64], [-64, 64, -64]],
                 [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 0]])
 
     positions = []
