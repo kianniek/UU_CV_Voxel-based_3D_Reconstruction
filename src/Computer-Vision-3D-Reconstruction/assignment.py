@@ -3,6 +3,7 @@ import numpy as np
 import cv2
 import cv2 as cv
 import os
+import xml.etree.ElementTree as ET
 
 # region Configuration
 block_size   = 1.2
@@ -20,6 +21,460 @@ _voxel_world  = None
 _in_front     = None
 _cam_depths   = None
 _frame_idx    = 0
+
+CHECKERBOARD_SIZE = (6, 8)  # Defined in checkerboard.xml
+SQUARE_SIZE = 25             # mm
+
+def get_config_path(cam_id):
+    return os.path.join(DATA_DIR, f'cam{cam_id}', 'config.xml')
+
+# endregion
+
+# region Task 1: Calibration – Automatic Chessboard Corner Detection
+
+def _preprocess_variants(gray):
+    """Yield (label, image) pairs with increasingly aggressive preprocessing."""
+    yield "original", gray
+
+    yield "blur_5", cv2.GaussianBlur(gray, (5, 5), 0)
+    yield "blur_7", cv2.GaussianBlur(gray, (7, 7), 0)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    yield "clahe", clahe.apply(gray)
+    yield "clahe_blur", cv2.GaussianBlur(clahe.apply(gray), (5, 5), 0)
+
+    eq = cv2.equalizeHist(gray)
+    yield "histeq", eq
+    yield "histeq_blur", cv2.GaussianBlur(eq, (5, 5), 0)
+
+    yield "bilateral", cv2.bilateralFilter(gray, 9, 75, 75)
+
+    blurred = cv2.GaussianBlur(gray, (0, 0), 3)
+    sharp = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
+    yield "sharpened", sharp
+
+
+def auto_detect_chessboard_corners(cam_id, cols, rows):
+    """Fully-automatic chessboard corner detection from checkerboard.avi.
+
+    Tries multiple frames and preprocessing strategies until the board is
+    found.  Returns:
+        corners2d  – (rows*cols, 1, 2) refined inner corners
+        handles    – (4, 2) the four extreme corners [TL, TR, BR, BL]
+    """
+    video_path = os.path.join(DATA_DIR, f'cam{cam_id}', 'checkerboard.avi')
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open {video_path}")
+
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    pattern_size = (cols, rows)
+
+    cb_flags = (cv2.CALIB_CB_ADAPTIVE_THRESH |
+                cv2.CALIB_CB_NORMALIZE_IMAGE |
+                cv2.CALIB_CB_FAST_CHECK)
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                100, 0.001)
+
+    sample_indices = sorted(set([
+        frame_count // 2,
+        0,
+        frame_count - 1,
+        frame_count // 4,
+        3 * frame_count // 4,
+        frame_count // 3,
+        2 * frame_count // 3,
+    ]))
+
+    best_corners = None
+    best_gray = None
+    best_label = ""
+
+    for fidx in sample_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        for label, img in _preprocess_variants(gray):
+            found, corners = cv2.findChessboardCorners(img, pattern_size, cb_flags)
+            if found:
+                refined = cv2.cornerSubPix(gray, corners, (11, 11),
+                                           (-1, -1), criteria)
+                best_corners = refined
+                best_gray = gray
+                best_label = f"findChessboardCorners/{label}/frame{fidx}"
+                break
+
+        if best_corners is not None:
+            break
+
+        try:
+            found, corners = cv2.findChessboardCornersSB(gray, pattern_size)
+            if found:
+                best_corners = corners
+                best_gray = gray
+                best_label = f"findChessboardCornersSB/frame{fidx}"
+        except AttributeError:
+            pass
+
+        if best_corners is not None:
+            break
+
+    cap.release()
+
+    if best_corners is None:
+        raise RuntimeError(
+            f"Cam {cam_id}: automatic chessboard detection failed on all "
+            f"{len(sample_indices)} sampled frames with all preprocessing "
+            f"strategies.  Consider falling back to manual calibration.")
+
+    print(f"  Cam {cam_id}: auto-detected via {best_label}")
+
+    c = best_corners.reshape(-1, 2)
+    idx_tl = 0
+    idx_tr = cols - 1
+    idx_br = rows * cols - 1
+    idx_bl = (rows - 1) * cols
+
+    handles = np.array([
+        c[idx_tl],
+        c[idx_tr],
+        c[idx_br],
+        c[idx_bl],
+    ], dtype=np.float32)
+
+    return best_corners, handles
+
+
+# Projects a grid onto the image plane using a perspective transform derived from the corners
+def project_grid_perspective(four_corners, cols, rows):
+    src_ideal = np.array([
+        [0, 0], [cols-1, 0], [cols-1, rows-1], [0, rows-1]
+    ], dtype=np.float32)
+    dst_current = np.array(four_corners, dtype=np.float32)
+    H_matrix = cv2.getPerspectiveTransform(src_ideal, dst_current)
+    grid_x, grid_y = np.meshgrid(np.arange(cols), np.arange(rows))
+    ideal_points = np.vstack([grid_x.ravel(), grid_y.ravel()]).T.astype(np.float32).reshape(-1, 1, 2)
+    return cv2.perspectiveTransform(ideal_points, H_matrix)
+
+
+# Warps the image region to a flat view to refine corner detection, then projects points back
+def refine_corners_via_warping(image_gray, four_corners, cols, rows):
+    w_top = np.linalg.norm(four_corners[0] - four_corners[1])
+    w_bot = np.linalg.norm(four_corners[3] - four_corners[2])
+    h_left = np.linalg.norm(four_corners[0] - four_corners[3])
+    h_right = np.linalg.norm(four_corners[1] - four_corners[2])
+    dst_width = int(max(w_top, w_bot))
+    dst_height = int(max(h_left, h_right))
+    padding = 50
+    dst_corners = np.array([
+        [padding, padding],
+        [padding + dst_width, padding],
+        [padding + dst_width, padding + dst_height],
+        [padding, padding + dst_height]
+    ], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(np.array(four_corners, dtype=np.float32), dst_corners)
+    M_inv = np.linalg.inv(M)
+    warped_image = cv2.warpPerspective(image_gray, M, (dst_width + 2*padding, dst_height + 2*padding))
+    grid_x, grid_y = np.meshgrid(
+        np.linspace(padding, padding + dst_width, cols),
+        np.linspace(padding, padding + dst_height, rows)
+    )
+    warped_guesses = np.vstack([grid_x.ravel(), grid_y.ravel()]).T.astype(np.float32)
+    warped_guesses = np.ascontiguousarray(warped_guesses).reshape(-1, 1, 2)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001)
+    refined_warped = cv2.cornerSubPix(warped_image, warped_guesses, (5, 5), (-1, -1), criteria)
+    return cv2.perspectiveTransform(refined_warped, M_inv)
+
+
+# Interactive GUI with Magnifying Glass to allow users to move 4 corners (manual fallback)
+def select_corners_interface(image_gray, cols, rows, initial_handles=None):
+    CLICK_SENSITIVITY = 20
+    HANDLE_RADIUS = 1
+    GRID_RADIUS = 1
+    height, width = image_gray.shape
+    if initial_handles is not None:
+        handles = [np.array(pt, dtype=np.float32) for pt in initial_handles]
+    else:
+        margin_horizontal, margin_vertical = width // 4, height // 4
+        handles = [
+            np.array([margin_horizontal, margin_vertical], dtype=np.float32),
+            np.array([width - margin_horizontal, margin_vertical], dtype=np.float32),
+            np.array([width - margin_horizontal, height - margin_vertical], dtype=np.float32),
+            np.array([margin_horizontal, height - margin_vertical], dtype=np.float32)
+        ]
+    state = {
+        "drag_index": None,
+        "mouse_pos": (width // 2, height // 2),
+        "handles": handles
+    }
+    window_name = "Manual Calibration - Drag corners. Press 'c' to confirm"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1080, int(1080 * (height/width)))
+
+    def mouse_callback(event, x, y, flags, param):
+        state["mouse_pos"] = (x, y)
+        if event == cv2.EVENT_LBUTTONDOWN:
+            for idx, pt in enumerate(state["handles"]):
+                if np.linalg.norm(pt - [x, y]) < CLICK_SENSITIVITY:
+                    state["drag_index"] = idx
+                    break
+        elif event == cv2.EVENT_MOUSEMOVE and state["drag_index"] is not None:
+            state["handles"][state["drag_index"]] = np.array([x, y], dtype=np.float32)
+        elif event == cv2.EVENT_LBUTTONUP:
+            if state["drag_index"] is not None:
+                corner = np.array([[[x, y]]], dtype=np.float32)
+                corner = np.ascontiguousarray(corner)
+                state["handles"][state["drag_index"]] = corner[0, 0]
+                state["drag_index"] = None
+
+    cv2.setMouseCallback(window_name, mouse_callback)
+    display_color = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
+    colors = [(0, 0, 255), (255, 0, 0), (0, 255, 0), (0, 255, 255)]
+    while True:
+        temp_img = display_color.copy()
+        corner_points = np.array(state["handles"], np.int32).reshape((-1, 1, 2))
+        cv2.polylines(temp_img, [corner_points], True, (255, 255, 0), 1)
+        grid_points = project_grid_perspective(state["handles"], cols, rows)
+        if grid_points is not None:
+            for point in grid_points:
+                cv2.circle(temp_img, tuple(point[0].astype(int)), GRID_RADIUS, (0, 255, 0), -1)
+        for idx, point in enumerate(state["handles"]):
+            cv2.circle(temp_img, tuple(point.astype(int)), HANDLE_RADIUS, colors[idx], -1)
+        mouse_x = np.clip(state["mouse_pos"][0], 0, width - 1)
+        mouse_y = np.clip(state["mouse_pos"][1], 0, height - 1)
+        pad_size = 30
+        pad_img = cv2.copyMakeBorder(temp_img, pad_size, pad_size, pad_size, pad_size, cv2.BORDER_REPLICATE)
+        cx, cy = mouse_x + pad_size, mouse_y + pad_size
+        patch = pad_img[cy-pad_size:cy+pad_size, cx-pad_size:cx+pad_size]
+        zoom_size = pad_size * 4
+        patch_zoomed = cv2.resize(patch, (zoom_size, zoom_size), interpolation=cv2.INTER_NEAREST)
+        cv2.line(patch_zoomed, (zoom_size//2, 0), (zoom_size//2, zoom_size), (255, 255, 255), 1)
+        cv2.line(patch_zoomed, (0, zoom_size//2), (zoom_size, zoom_size//2), (255, 255, 255), 1)
+        cv2.rectangle(patch_zoomed, (0,0), (zoom_size-1, zoom_size-1), (255, 255, 255), 2)
+        if mouse_x > width - zoom_size - 20 and mouse_y < zoom_size + 20:
+            temp_img[10:10+zoom_size, 10:10+zoom_size] = patch_zoomed
+        else:
+            temp_img[10:10+zoom_size, width-zoom_size-10:width-10] = patch_zoomed
+        cv2.imshow(window_name, temp_img)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('c'):
+            try:
+                refined_corner_points = refine_corners_via_warping(image_gray, state["handles"], cols, rows)
+                cv2.destroyWindow(window_name)
+                return refined_corner_points, np.array(state["handles"])
+            except Exception as e:
+                print(f"Refinement failed: {e}")
+
+
+def calibrate_intrinsics(cam_id):
+    """Calibrate camera intrinsics using intrinsics.avi and checkerboard.xml."""
+    xml_path = os.path.join(DATA_DIR, 'checkerboard.xml')
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    cols = int(root.find("CheckerBoardWidth").text)
+    rows = int(root.find("CheckerBoardHeight").text)
+    square_size = float(root.find("CheckerBoardSquareSize").text)
+
+    object_points = np.zeros((rows * cols, 3), np.float32)
+    object_points[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
+    object_points *= square_size
+
+    video_path = os.path.join(DATA_DIR, f'cam{cam_id}', 'intrinsics.avi')
+    cap = cv2.VideoCapture(video_path)
+    objpoints = []
+    imgpoints = []
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step = max(1, frame_count // 10)
+    for i in range(0, frame_count, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        found, corners = cv2.findChessboardCorners(gray, (cols, rows), None)
+        if found:
+            corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1),
+                                        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
+            objpoints.append(object_points)
+            imgpoints.append(corners2)
+    cap.release()
+    if len(objpoints) < 3:
+        raise RuntimeError("Not enough valid frames for calibration.")
+    ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray.shape[::-1], None, None)
+    return mtx, dist
+
+
+def calibrate_extrinsics(cam_id, mtx, dist):
+    """Calibrate camera extrinsics – fully automatic with manual fallback."""
+    xml_path = os.path.join(DATA_DIR, 'checkerboard.xml')
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    cols = int(root.find("CheckerBoardWidth").text)
+    rows = int(root.find("CheckerBoardHeight").text)
+    square_size = float(root.find("CheckerBoardSquareSize").text)
+
+    object_points = np.zeros((rows * cols, 3), np.float32)
+    object_points[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
+    object_points *= square_size
+
+    print(f"--- Extrinsic Calibration: Camera {cam_id} ---")
+
+    try:
+        corners2d, handles = auto_detect_chessboard_corners(cam_id, cols, rows)
+        print(f"  Cam {cam_id}: automatic detection succeeded.")
+    except RuntimeError as e:
+        print(f"  Cam {cam_id}: auto-detection failed ({e}), falling back to manual...")
+        initial_handles = None
+        config_path = get_config_path(cam_id)
+        if os.path.exists(config_path):
+            fs_read = cv2.FileStorage(config_path, cv2.FILE_STORAGE_READ)
+            corner_node = fs_read.getNode("manual_corners")
+            if not corner_node.empty():
+                initial_handles = corner_node.mat()
+            fs_read.release()
+
+        video_path = os.path.join(DATA_DIR, f'cam{cam_id}', 'checkerboard.avi')
+        cap = cv2.VideoCapture(video_path)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count // 2)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            raise RuntimeError(f"Could not read checkerboard frame for Cam {cam_id}.")
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners2d, handles = select_corners_interface(gray, cols, rows, initial_handles)
+
+    ret, rvec, tvec = cv2.solvePnP(object_points, corners2d, mtx, dist)
+    return rvec, tvec, handles
+
+
+def save_all_params(cam_id, mtx, dist, rvec, tvec, manual_corners):
+    """Save all calibration parameters to an XML file for future use."""
+    fs = cv2.FileStorage(get_config_path(cam_id), cv2.FILE_STORAGE_WRITE)
+    fs.write("camera_matrix", mtx)
+    fs.write("distortion_coefficients", dist)
+    fs.write("rotation_vector", rvec)
+    fs.write("translation_vector", tvec)
+    fs.write("manual_corners", manual_corners)
+    fs.release()
+
+
+def visualize_checkerboard_start(cam_id, mtx, dist, rvec, tvec):
+    """Project the world origin axes onto a checkerboard frame for visual verification."""
+    xml_path = os.path.join(DATA_DIR, 'checkerboard.xml')
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    square_size = float(root.find("CheckerBoardSquareSize").text)
+    axis_length = square_size * 3
+    axis_points = np.float32([
+        [0, 0, 0],
+        [axis_length, 0, 0],
+        [0, axis_length, 0],
+        [0, 0, -axis_length]
+    ])
+    axis_colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
+    imgpts, _ = cv2.projectPoints(axis_points, rvec, tvec, mtx, dist)
+    imgpts = imgpts.reshape(-1, 2).astype(int)
+
+    video_path = os.path.join(DATA_DIR, f'cam{cam_id}', 'checkerboard.avi')
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 5)
+    ret, frame = cap.read()
+    cap.release()
+
+    if ret:
+        origin = tuple(imgpts[0])
+        pt_x = tuple(imgpts[1])
+        pt_y = tuple(imgpts[2])
+        pt_z = tuple(imgpts[3])
+        cv2.line(frame, origin, pt_x, axis_colors[0], 2)
+        cv2.line(frame, origin, pt_y, axis_colors[1], 2)
+        cv2.line(frame, origin, pt_z, axis_colors[2], 2)
+        cv2.circle(frame, origin, 3, (255, 255, 255), -1)
+        cv2.imshow(f"Camera {cam_id} Axes", frame)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    else:
+        print(f"Error: Could not load frame for Camera {cam_id}")
+
+
+def verify_origin_alignment():
+    """Show all 4 cameras side-by-side with projected world origin + axes."""
+    xml_path = os.path.join(DATA_DIR, 'checkerboard.xml')
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    square_size = float(root.find("CheckerBoardSquareSize").text)
+
+    axis_length = square_size * 3
+    axis_pts_3d = np.float32([
+        [0, 0, 0],
+        [axis_length, 0, 0],
+        [0, axis_length, 0],
+        [0, 0, -axis_length],
+    ])
+
+    panels = []
+    for cid in CAM_IDS:
+        fs = cv2.FileStorage(get_config_path(cid), cv2.FILE_STORAGE_READ)
+        K    = fs.getNode("camera_matrix").mat()
+        dist = fs.getNode("distortion_coefficients").mat()
+        rv   = fs.getNode("rotation_vector").mat()
+        tv   = fs.getNode("translation_vector").mat()
+        fs.release()
+
+        cap = cv2.VideoCapture(os.path.join(DATA_DIR, f'cam{cid}', 'checkerboard.avi'))
+        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, n_frames // 2)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            frame = np.zeros((480, 640, 3), np.uint8)
+
+        imgpts, _ = cv2.projectPoints(axis_pts_3d, rv, tv, K, dist)
+        imgpts = imgpts.reshape(-1, 2).astype(int)
+        o, px, py, pz = [tuple(p) for p in imgpts]
+
+        cv2.line(frame, o, px, (0, 0, 255), 3)
+        cv2.line(frame, o, py, (0, 255, 0), 3)
+        cv2.line(frame, o, pz, (255, 0, 0), 3)
+        cv2.circle(frame, o, 5, (255, 255, 255), -1)
+
+        cols = int(root.find("CheckerBoardWidth").text)
+        rows = int(root.find("CheckerBoardHeight").text)
+        board_corners_3d = np.float32([
+            [0, 0, 0],
+            [(cols - 1) * square_size, 0, 0],
+            [(cols - 1) * square_size, (rows - 1) * square_size, 0],
+            [0, (rows - 1) * square_size, 0],
+        ])
+        bc_px, _ = cv2.projectPoints(board_corners_3d, rv, tv, K, dist)
+        bc_px = bc_px.reshape(-1, 2).astype(int)
+        for j in range(4):
+            cv2.line(frame, tuple(bc_px[j]), tuple(bc_px[(j + 1) % 4]),
+                     (0, 255, 255), 1)
+
+        cv2.putText(frame, f"Cam {cid}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(frame, "origin = white dot", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        panels.append(frame)
+
+    h, w = panels[0].shape[:2]
+    for i in range(len(panels)):
+        panels[i] = cv2.resize(panels[i], (w, h))
+    top = np.hstack(panels[:2])
+    bot = np.hstack(panels[2:])
+    grid = np.vstack([top, bot])
+
+    cv2.imshow("Origin Alignment Check", grid)
+    print("CHECK: The white dot + RGB axes must sit on the SAME physical")
+    print("corner of the checkerboard in all 4 views.  Press any key to close.")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
 # endregion
 
@@ -454,6 +909,115 @@ def get_cam_rotation_matrices():
 
 # endregion
 
+# region Task 3: Standalone Voxel Reconstruction (notebook pipeline)
+
+def load_camera_config(cam_id):
+    """Load camera calibration parameters from saved config.xml."""
+    config_path = get_config_path(cam_id)
+    fs = cv2.FileStorage(config_path, cv2.FILE_STORAGE_READ)
+    mtx  = fs.getNode("camera_matrix").mat()
+    dist = fs.getNode("distortion_coefficients").mat()
+    rvec = fs.getNode("rotation_vector").mat()
+    tvec = fs.getNode("translation_vector").mat()
+    fs.release()
+    return mtx, dist, rvec, tvec
+
+
+def build_lookup_table(cam_configs, grid_width=128, grid_height=64, grid_depth=128):
+    """Build lookup table: project each 3D voxel position to 2D for each camera.
+
+    Returns
+    -------
+    voxel_positions : ndarray  (N, 3) – world coordinates (mm)
+    lookup_table    : dict  cam_index -> (N, 2) pixel coords
+    in_front        : dict  cam_index -> bool array (N,)
+    """
+    step = VOXEL_STEP
+    half_w = (grid_width  / 2) * step
+    half_d = (grid_depth  / 2) * step
+    h_max  = grid_height * step
+
+    xs = np.arange(-half_w, half_w, step, dtype=np.float64)
+    ys = np.arange(-half_d, half_d, step, dtype=np.float64)
+    zs = np.arange(-h_max,  0,      step, dtype=np.float64)
+
+    xx, yy, zz = np.meshgrid(xs, ys, zs, indexing='ij')
+    voxel_positions = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=1)
+
+    N = len(voxel_positions)
+    print(f"Building LUT: {len(xs)}x{len(ys)}x{len(zs)} = {N:,} voxels "
+          f"(step {step} mm)")
+
+    lookup_table = {}
+    in_front     = {}
+    for i, (mtx, dist, rvec, tvec) in enumerate(cam_configs):
+        proj, _ = cv2.projectPoints(voxel_positions, rvec, tvec, mtx, dist)
+        lookup_table[i] = proj.reshape(-1, 2)
+
+        R, _ = cv2.Rodrigues(rvec)
+        P_cam = (voxel_positions @ R.T) + tvec.T
+        in_front[i] = P_cam[:, 2] > 0
+
+        print(f"  Cam {i+1}: {np.sum(in_front[i]):,}/{N:,} in front")
+
+    return voxel_positions, lookup_table, in_front
+
+
+def reconstruct_voxels(masks, lookup_table, voxel_positions, in_front, frames=None):
+    """Reconstruct voxels by intersecting foreground across all cameras."""
+    N = len(voxel_positions)
+    active = np.ones(N, dtype=bool)
+
+    for ci in range(len(masks)):
+        mask = masks[ci]
+        h, w = mask.shape[:2]
+        pr   = lookup_table[ci]
+        px   = np.round(pr[:, 0]).astype(np.int32)
+        py   = np.round(pr[:, 1]).astype(np.int32)
+
+        ok = (px >= 0) & (px < w) & (py >= 0) & (py < h) & in_front[ci]
+        fg = np.zeros(N, dtype=bool)
+        vi = np.where(ok)[0]
+        fg[vi] = mask[py[vi], px[vi]] > 0
+        active &= fg
+
+    aidx = np.where(active)[0]
+    aw   = voxel_positions[aidx]
+    print(f"Active voxels: {len(aidx):,} / {N:,}")
+
+    vx =  aw[:, 0] / VOXEL_STEP
+    vy = -aw[:, 2] / VOXEL_STEP
+    vz =  aw[:, 1] / VOXEL_STEP
+    data = np.stack([vx, vy, vz], axis=1).tolist()
+
+    if frames is not None and any(f is not None for f in frames):
+        cs = np.zeros((len(aidx), 3))
+        cc = np.zeros(len(aidx))
+        for ci in range(len(frames)):
+            if frames[ci] is None:
+                continue
+            pr = lookup_table[ci][aidx]
+            px = np.round(pr[:, 0]).astype(np.int32)
+            py = np.round(pr[:, 1]).astype(np.int32)
+            fh, fw = frames[ci].shape[:2]
+            ok = (px >= 0) & (px < fw) & (py >= 0) & (py < fh)
+            ii = np.where(ok)[0]
+            if len(ii):
+                bgr = frames[ci][py[ii], px[ii]]
+                cs[ii] += bgr[:, ::-1] / 255.0
+                cc[ii] += 1
+        has  = cc > 0
+        cols = np.where(has[:, None], cs / np.maximum(cc[:, None], 1), 0.5)
+        colors = cols.tolist()
+    else:
+        colors = [[0.5, vy_i / 64.0, 0.5] for vy_i in vy]
+
+    if not data:
+        data, colors = [[0, 0, 0]], [[1, 1, 1]]
+    return data, colors
+
+# endregion
+
 # region Debug Helpers
 _last_masks  = [None] * 4
 _last_frames = [None] * 4
@@ -481,5 +1045,94 @@ def get_debug_cam_info(cam_index):
     fwd = glm.normalize(fwd)
 
     return pos, fwd, _last_masks[cam_index], _last_frames[cam_index]
+
+# endregion
+
+
+# region Main Pipeline
+
+def run_pipeline():
+    """Run the full calibration → background subtraction → voxel reconstruction pipeline."""
+
+    # 1. Run Calibration
+    print("=== Step 1: Camera Calibration ===")
+    for cam_id in CAM_IDS:
+        mtx, dist = calibrate_intrinsics(cam_id)
+        rvec, tvec, handles = calibrate_extrinsics(cam_id, mtx, dist)
+        save_all_params(cam_id, mtx, dist, rvec, tvec, handles)
+        print(f"Visualizing Origin for Camera {cam_id}...")
+        visualize_checkerboard_start(cam_id, mtx, dist, rvec, tvec)
+
+    # 1b. Verify all cameras share the same world origin
+    print("\n=== Verifying Origin Alignment ===")
+    verify_origin_alignment()
+
+    # 2. Ensure BG Models are available
+    print("\n=== Step 2: Background Subtraction ===")
+    if len(bg_models) < len(CAM_IDS):
+        for cid in CAM_IDS:
+            if cid - 1 >= len(bg_models) or bg_models[cid - 1] is None:
+                create_background_model_simple(cid)
+
+    # 3. Show foreground masks for each camera in sequence
+    exit_all = False
+    for cam_id in CAM_IDS:
+        if exit_all:
+            break
+        video = get_video(cam_id)
+        window_name = f'Camera {cam_id} - Foreground Mask (q: next, x/ESC: exit)'
+        cv.namedWindow(window_name, cv.WINDOW_NORMAL)
+        while True:
+            ret, frame = video.read()
+            if not ret:
+                break
+            mask = get_foreground_mask_simple(frame, bg_models[cam_id - 1])
+            cv.imshow(window_name, mask)
+            key = cv.waitKey(30) & 0xFF
+            if key == ord('q'):
+                break
+            if key == ord('x') or key == 27:
+                exit_all = True
+                break
+        video.release()
+        cv.destroyWindow(window_name)
+
+    # 4. Build Voxel Lookup Table
+    print("\n=== Step 3: Building Voxel Lookup Table ===")
+    cam_configs = []
+    for cam_id in CAM_IDS:
+        cam_configs.append(load_camera_config(cam_id))
+    voxel_positions, lookup_table, in_front = build_lookup_table(cam_configs)
+
+    # 5. Reconstruct Voxels from first frame
+    print("\n=== Step 4: Voxel Reconstruction ===")
+    masks_for_recon = []
+    frames_for_color = []
+    for i, cam_id in enumerate(CAM_IDS):
+        video = get_video(cam_id)
+        ret, frame = video.read()
+        video.release()
+        if ret:
+            frames_for_color.append(frame)
+            masks_for_recon.append(
+                get_foreground_mask_simple(frame, bg_models[cam_id - 1]))
+        else:
+            frames_for_color.append(None)
+            masks_for_recon.append(np.zeros((480, 640), np.uint8))
+
+    voxel_data, voxel_colors = reconstruct_voxels(
+        masks_for_recon, lookup_table, voxel_positions, in_front,
+        frames=frames_for_color)
+
+    # Save results for use by the 3D visualiser
+    np.savez(os.path.join(DATA_DIR, 'voxel_reconstruction.npz'),
+             data=np.array(voxel_data, dtype=np.float32),
+             colors=np.array(voxel_colors, dtype=np.float32))
+    print(f"Saved {len(voxel_data)} voxels to data/voxel_reconstruction.npz")
+    print("\nPipeline complete.")
+
+
+if __name__ == '__main__':
+    run_pipeline()
 
 # endregion
