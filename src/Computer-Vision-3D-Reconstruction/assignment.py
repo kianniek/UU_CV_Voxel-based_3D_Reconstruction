@@ -69,6 +69,14 @@ def _ensure_bg_models():
 # - https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
 # - https://github.com/pransen/ComputerVisionAlgorithms/blob/master/GaussianMixtureModelling/README.md
 
+#region Helper Functions for retrieving video material
+def get_background_video(cam_id):
+    return cv.VideoCapture(f'../data/cam{cam_id}/background.avi')
+
+def get_video(cam_id):
+    return cv.VideoCapture(f'../data/cam{cam_id}/video.avi')
+#endregion
+
 bg_models = []
 basic_bg = []
 
@@ -119,11 +127,157 @@ def gaussian_fit(pixel):
     return gm(n_components=1, covariance_type="full", reg_covar = 1).fit(pixel)
 # endregion
 
-# Model the background GMM per camera
-for id in CAM_IDS:
-    create_background_model_mog(id)
+MIN_WEIGHT = 2.5
+MAX_WEIGHT = 10.0
+
+# Create a foreground mask per camera using the background model made earlier
+def get_foreground_mask(frame, mean, covar, thresholds = [15, 15, 15], thresholding = False):
+    """Creates a foreground mask per frame, using the calculated means and covariance matrix, as well as the HSV thresholds"""
+
+    frame_hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+    
+    weight_h, weight_v, weight_s = thresholds
+    
+    difference = frame_hsv.astype(np.float32) - mean
+    diff_h, diff_s, diff_v = cv.split(difference)
+    
+    # Calculate the Mahalanobis Distance between pixel value X and model means 
+    # source: https://anandksub.dev/blog/gmm_mahalanobis
+    
+    covar_h = covar[:,:,0] # Top Part of Covariance Metrix    [VarH, CovHS, CovHV]
+    covar_s = covar[:,:,1] # Middle Part of Covariance Matrix [CovSH, VarS, CovSV]
+    covar_v = covar[:,:,2] # Bottom Part of Covariance MAtrix [CovVH, CovVS, VarV]
+
+    # Calculate the Mahalanobis distance for each channel separately. 
+    # Square Root of (value X - mu) * inverse_covariance * value X - mu 
+    dist_h = np.sqrt(diff_h * (covar_h[:,:,0]*diff_h + covar_h[:,:,1]*diff_s + covar_h[:,:,2]*diff_v))
+    dist_s = np.sqrt(diff_s * (covar_s[:,:,0]*diff_h + covar_s[:,:,1]*diff_s + covar_s[:,:,2]*diff_v))
+    dist_v = np.sqrt(diff_v * (covar_v[:,:,0]*diff_h + covar_v[:,:,1]*diff_s + covar_v[:,:,2]*diff_v))
+
+    # Threshold each channel separately with weights adapted beforehand
+    foreground_h = dist_h > weight_h
+    foreground_s = dist_s > weight_s
+    foreground_v = dist_v > weight_v
+
+    # Detects foreground from both a hue + saturation change (shade has changed and became darker)
+    # or with a hue + value change (shade has changed and became brighter)
+    foreground = (foreground_h & foreground_s) | (foreground_h & foreground_v)
+    mask = (foreground * 255).astype(np.uint8)
+    
+    if not thresholding:
+        mask = post_process(mask)
+    return mask
+
+def post_process(mask):
+    # Post Processing
+    kernel = cv.getStructuringElement(cv.MORPH_RECT, (4,4))
+    
+    # Morphological Operations. 
 
 
+    # There's still quite a bit of noise left after morphological operations
+    # Use OpenCV's function to find and label all components in image depending on the connectivity
+    
+    blobs = cv2.connectedComponentsWithStats(mask, 4, cv.CV_32S)
+    num, labels, stats, centroids = blobs
+    biggest_blob = stats[1:, cv.CC_STAT_AREA].max() # Determine the biggest area (often the horse)
+    
+    # Go through labels, if label area is smaller than blob, set it to 0 since it is noise
+    for i in range(1, num):
+        if stats[i, cv.CC_STAT_AREA] < biggest_blob:
+            mask[labels == i] = 0
+    
+    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel) # Dilate => Erode (fill in inner gaps)
+    mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel) # Erode => Dilate (remove surrounding noise)
+    
+    return mask
+# CHOICE 2: Automated thresholding function
+def optimize_thresholds(frame, mean, covar, iterations = 30):
+    """Tries out random threshold values using the first frame as a reference. """
+    
+    most_optimal_thresholds = [0, 0, 0]
+    lowest_score = float('inf')
+
+    # Iterate based on given iterations param
+    for i in range(iterations):
+        min_weights = [MIN_WEIGHT, MIN_WEIGHT, MIN_WEIGHT] * 2
+        max_weights = [MAX_WEIGHT, MAX_WEIGHT, MAX_WEIGHT * 2]
+
+        weights = [np.random.uniform(min_weights[0], max_weights[0]), np.random.uniform(min_weights[1], max_weights[1]), np.random.uniform(min_weights[2], max_weights[2])]
+        
+        mask = get_foreground_mask(frame, mean, covar, weights, True)
+        
+        # compute noise in the foreground mask using the current thresholds
+        noise = np.sum(mask == 0) / (mask.shape[0] * mask.shape[1])
+        
+        # if the noise is less than the lowest score, update the most optimal thresholds and lowest score
+        if noise < lowest_score:
+            lowest_score = noise
+            
+            # update weights for next iteration to be around the current optimal weights
+
+            for i, weight in enumerate(weights):
+                min_weights[i] = weight - 2
+                max_weights[i] = weight + 2
+
+            most_optimal_thresholds = weights
+        
+    return most_optimal_thresholds
+
+# Unpacks the pixel's model values into the mean and covariance
+def unpack_gaussian_model(frame, model):
+    """Get the mean and covariance values from a pixel model"""
+    mean = []
+    covariance = []
+    
+    for pixel in model:
+        mean.append(pixel.means_)
+        covariance.append(pixel.covariances_)
+        
+    # Reshape to match image dimensions W x H
+    x, y, c = frame.shape
+    mean = np.reshape(mean, (x, y , c))
+    covariance = np.reshape(covariance, (x, y, 3, 3))
+    cov_inv = np.linalg.inv(covariance[:,:])
+    return mean, cov_inv
+
+# region Main Code
+def subtract():
+    """Main function that runs the foreground masking process"""
+    for id in CAM_IDS:
+        video = get_video(id)
+
+        ret, frame = video.read()
+        # initialize weights
+        weight_h, weight_s, weight_v = MIN_WEIGHT, MIN_WEIGHT, MIN_WEIGHT
+        
+        if not ret:
+            print(f"Error reading video for camera {id}")
+        
+        # Try out various weight values and calculate the ideal weight based on optimal noise score    
+        mean, covar = unpack_gaussian_model(frame, bg_models[id-1])
+        weight_h, weight_s, weight_v = optimize_thresholds(frame, mean, covar)
+        
+        print(f"Optimal thresholds for camera {id-1}: H: {weight_h}, S: {weight_s}, V: {weight_v}")
+
+        while True:
+            ret, frame = video.read()
+            if not ret:
+                break
+            mask = get_foreground_mask(frame, mean, covar, [weight_h, weight_s, weight_v])
+            mask = cv.resize(mask, (frame.shape[1], frame.shape[0]))
+            
+            masked_frame = cv.bitwise_and(frame, frame, mask=mask)
+            cv.imshow(f'Camera {id-1} - Masked Frame', masked_frame)
+            
+            # if cv.waitKey(30) & 0xFF == ord('w'):
+            #     weight +=2
+                
+            if cv.waitKey(30) & 0xFF == ord('q'):
+                break
+        video.release()
+#endregion
+subtract()
 
 # Builds and caches a lookup table that projects every 3D voxel to 2D pixel coordinates per camera.
 # World coords: X,Y on floor, Z<0 above floor. Visualiser coords: X,Z on floor, Y up.
