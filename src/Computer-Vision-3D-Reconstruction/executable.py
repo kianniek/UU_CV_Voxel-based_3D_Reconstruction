@@ -36,7 +36,7 @@ _g_pressed_once = False
 _orbit_active = False
 _orbit_angle = 0.0            # current horizontal angle (radians)
 _orbit_radius = 150.0         # distance from centre
-_orbit_speed = 0.5            # radians / second  (current, lerped)
+_orbit_speed = 0.5            # radians / second (current, lerped)
 _orbit_speed_target = 0.5     # target after key press
 _orbit_pitch = 30.0           # elevation in degrees  (current, lerped)
 _orbit_pitch_target = 30.0    # target after key press
@@ -258,6 +258,54 @@ def _close_debug_overlay():
     _debug_cam_index = -1
 
 
+def _show_all_masks():
+    """Display all 4 camera masks side-by-side in a 2x2 mosaic."""
+    from assignment import _last_masks, _last_frames
+
+    panels = []
+    for i in range(4):
+        mask = _last_masks[i]
+        frame = _last_frames[i]
+        if mask is not None and frame is not None:
+            overlay = frame.copy()
+            green = np.zeros_like(overlay); green[:] = (0, 255, 0)
+            mask_3ch = cv2.merge([mask, mask, mask])
+            overlay = np.where(mask_3ch > 0,
+                               cv2.addWeighted(overlay, 0.5, green, 0.5, 0),
+                               overlay)
+            cv2.putText(overlay, f'Cam {i+1}', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            panels.append(overlay)
+        elif mask is not None:
+            panel = cv2.merge([mask, mask, mask])
+            cv2.putText(panel, f'Cam {i+1}', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            panels.append(panel)
+        else:
+            panels.append(None)
+
+    if all(p is None for p in panels):
+        print('No masks available yet - press G first to run a reconstruction.')
+        return
+
+    # Use the shape of the first available panel as reference
+    ref = next(p for p in panels if p is not None)
+    h, w = ref.shape[:2]
+    for i in range(4):
+        if panels[i] is None:
+            blank = np.zeros((h, w, 3), dtype=np.uint8)
+            cv2.putText(blank, f'Cam {i+1} (no data)', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (128, 128, 128), 2)
+            panels[i] = blank
+
+    top = np.hstack([panels[0], panels[1]])
+    bot = np.hstack([panels[2], panels[3]])
+    mosaic = np.vstack([top, bot])
+
+    cv2.imshow('All Camera Masks', mosaic)
+    cv2.waitKey(1)
+
+
 def _start_sequence(mode='union'):
     """Start the sequential demo: cam1 → cam2 → cam3 → cam4.
 
@@ -443,6 +491,9 @@ def key_callback(window, key, scancode, action, mods):
 
     if key == glfw.KEY_J and action == glfw.PRESS:
         _start_sequence(mode='intersect')
+
+    if key == glfw.KEY_M and action == glfw.PRESS:
+        _show_all_masks()
 
 
 def mouse_move(win, pos_x, pos_y):

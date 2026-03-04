@@ -112,7 +112,7 @@ def create_background_model_mog(cam_id):
     # time_start = time.perf_counter()
     
     # 4. For each point characterized by the x-coordinate, the y-coordinate and the channel, 
-    # model the HSV value as a mixture of Gaussians using SciKit's GaussianMixture library.  
+    # model the HSV value as a mixture of Gaussians using SciKit's GaussianMixture library.
     model = Parallel(n_jobs=-1)(delayed(gaussian_fit)(flat_stack[:,x,:]) 
                                 for x in range(frame_stack.shape[1] * frame_stack.shape[2]))
     
@@ -130,10 +130,12 @@ def gaussian_fit(pixel):
 MIN_WEIGHT = 2.5
 MAX_WEIGHT = 10.0
 
+_SMALL_KERNEL = cv.getStructuringElement(cv.MORPH_RECT, (2, 2))
+_MEDIUM_KERNEL = cv.getStructuringElement(cv.MORPH_RECT, (3, 3))
+_BIGGER_KERNEL = cv.getStructuringElement(cv.MORPH_RECT, (9, 9))
+
 # Create a foreground mask per camera using the background model made earlier
 def get_foreground_mask(frame, mean, covar, thresholds = [15, 15, 15], thresholding = False):
-    """Creates a foreground mask per frame, using the calculated means and covariance matrix, as well as the HSV thresholds"""
-
     frame_hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
     
     weight_h, weight_v, weight_s = thresholds
@@ -144,85 +146,84 @@ def get_foreground_mask(frame, mean, covar, thresholds = [15, 15, 15], threshold
     # Calculate the Mahalanobis Distance between pixel value X and model means 
     # source: https://anandksub.dev/blog/gmm_mahalanobis
     
-    covar_h = covar[:,:,0] # Top Part of Covariance Metrix    [VarH, CovHS, CovHV]
+    covar_h = covar[:,:,0] # Top Part of Covariance Metrix [VarH, CovHS, CovHV]
     covar_s = covar[:,:,1] # Middle Part of Covariance Matrix [CovSH, VarS, CovSV]
     covar_v = covar[:,:,2] # Bottom Part of Covariance MAtrix [CovVH, CovVS, VarV]
 
     # Calculate the Mahalanobis distance for each channel separately. 
     # Square Root of (value X - mu) * inverse_covariance * value X - mu 
-    dist_h = np.sqrt(diff_h * (covar_h[:,:,0]*diff_h + covar_h[:,:,1]*diff_s + covar_h[:,:,2]*diff_v))
-    dist_s = np.sqrt(diff_s * (covar_s[:,:,0]*diff_h + covar_s[:,:,1]*diff_s + covar_s[:,:,2]*diff_v))
-    dist_v = np.sqrt(diff_v * (covar_v[:,:,0]*diff_h + covar_v[:,:,1]*diff_s + covar_v[:,:,2]*diff_v))
+
+    dist_h = np.sqrt(np.maximum(diff_h * (covar_h[:,:,0]*diff_h + covar_h[:,:,1]*diff_s + covar_h[:,:,2]*diff_v), 0))
+    dist_s = np.sqrt(np.maximum(diff_s * (covar_s[:,:,0]*diff_h + covar_s[:,:,1]*diff_s + covar_s[:,:,2]*diff_v), 0))
+    dist_v = np.sqrt(np.maximum(diff_v * (covar_v[:,:,0]*diff_h + covar_v[:,:,1]*diff_s + covar_v[:,:,2]*diff_v), 0))
 
     # Threshold each channel separately with weights adapted beforehand
     foreground_h = dist_h > weight_h
     foreground_s = dist_s > weight_s
     foreground_v = dist_v > weight_v
 
-    # Detects foreground from both a hue + saturation change (shade has changed and became darker)
-    # or with a hue + value change (shade has changed and became brighter)
-    foreground = (foreground_h & foreground_s) | (foreground_h & foreground_v)
+    foreground = (foreground_h & foreground_s) | (foreground_h & foreground_v) | (foreground_s & foreground_v)
     mask = (foreground * 255).astype(np.uint8)
     
     if not thresholding:
         mask = post_process(mask)
     return mask
 
-def post_process(mask):
-    # Post Processing
-    kernel = cv.getStructuringElement(cv.MORPH_RECT, (3,3))
-    bigger_kernel = cv.getStructuringElement(cv.MORPH_RECT, (9,9))
-    
-    # Morphological Operations. 
-    
-    mask = cv.dilate(mask, kernel, iterations=3)
+# Post-process foreground mask to remove noise and fill gaps.
+def post_process(mask, min_area_ratio=1.0):
+    mask = cv.erode(mask, _SMALL_KERNEL, iterations=1)
+    mask = cv.dilate(mask, _MEDIUM_KERNEL, iterations=3)
 
-    # There's still quite a bit of noise left after morphological operations
-    # Use OpenCV's function to find and label all components in image depending on the connectivity
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 4, cv.CV_32S)
     
-    blobs = cv2.connectedComponentsWithStats(mask, 4, cv.CV_32S)
-    num, labels, stats, centroids = blobs
-    biggest_blob = stats[1:, cv.CC_STAT_AREA].max() # Determine the biggest area (often the horse)
+    if num > 1:
+        areas = stats[1:, cv.CC_STAT_AREA]
+        max_area = areas.max()
+        min_area = max_area * min_area_ratio
+        
+        small_blobs = np.where(areas < min_area)[0] + 1
+        mask[np.isin(labels, small_blobs)] = 0
     
-    # Go through labels, if label area is smaller than blob, set it to 0 since it is noise
-    for i in range(1, num):
-        if stats[i, cv.CC_STAT_AREA] < biggest_blob:
-            mask[labels == i] = 0
+    mask = cv.erode(mask, _MEDIUM_KERNEL, iterations=2)
+    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, _BIGGER_KERNEL)
     
-    mask = cv.erode(mask, kernel, iterations= 2)
-    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, bigger_kernel) # Dilate => Erode (fill in inner gaps)
-    
-    return mask
+    return mask 
 
 # CHOICE 2: Automated thresholding function
 def optimize_thresholds(frame, mean, covar, iterations = 30):
     """Tries out random threshold values using the first frame as a reference. """
     
-    most_optimal_thresholds = [0, 0, 0]
-    lowest_score = float('inf')
+    most_optimal_thresholds = [5.0, 5.0, 5.0]
+    best_score = float('inf')
+    
+    min_weights = [MIN_WEIGHT, MIN_WEIGHT, MIN_WEIGHT]
+    max_weights = [MAX_WEIGHT, MAX_WEIGHT, MAX_WEIGHT * 2]
+
+    TARGET_FG_RATIO = 0.08
 
     # Iterate based on given iterations param
-    for i in range(iterations):
-        min_weights = [MIN_WEIGHT, MIN_WEIGHT, MIN_WEIGHT] * 2
-        max_weights = [MAX_WEIGHT, MAX_WEIGHT, MAX_WEIGHT * 2]
-        weights = [np.random.uniform(min_weights[0], max_weights[0]), np.random.uniform(min_weights[1], max_weights[1]), np.random.uniform(min_weights[2], max_weights[2])]
+    for _ in range(iterations):
+        weights = [
+            np.random.uniform(min_weights[0], max_weights[0]),
+            np.random.uniform(min_weights[1], max_weights[1]),
+            np.random.uniform(min_weights[2], max_weights[2]),
+        ]
         
         mask = get_foreground_mask(frame, mean, covar, weights, True)
         
-        # compute noise in the foreground mask using the current thresholds
-        noise = np.sum(mask == 0) / (mask.shape[0] * mask.shape[1])
+        # Score: how far the foreground ratio is from the target
+        fg_ratio = np.sum(mask > 0) / (mask.shape[0] * mask.shape[1])
+        score = abs(fg_ratio - TARGET_FG_RATIO)
         
-        # if the noise is less than the lowest score, update the most optimal thresholds and lowest score
-        if noise < lowest_score:
-            lowest_score = noise
-            
-            # update weights for next iteration to be around the current optimal weights
-
-            for i, weight in enumerate(weights):
-                min_weights[i] = weight - 2
-                max_weights[i] = weight + 2
-
+        # If this is the best score so far, narrow search around these weights
+        if score < best_score:
+            best_score = score
             most_optimal_thresholds = weights
+            
+            # Narrow search bounds around the current best weights
+            for j, weight in enumerate(weights):
+                min_weights[j] = max(MIN_WEIGHT, weight - 2)
+                max_weights[j] = weight + 2
         
     return most_optimal_thresholds
 
@@ -409,22 +410,16 @@ def set_voxel_positions(width, height, depth, debug_cam=-1, debug_cams=None, deb
         if len(ii) == 0:
             continue
 
-        # --- Per-camera Z-buffer: only the closest voxel per pixel gets color ---
         depths = _cam_depths[ci][aidx[ii]]
 
-        # Sort descending by depth so the closest voxels (smallest depth) are
-        # written last and overwrite farther ones in the buffer.
         sort_order = np.argsort(-depths)
         px_sorted = px[ii[sort_order]]
         py_sorted = py[ii[sort_order]]
         ii_sorted = ii[sort_order]
 
-        # Scatter local-index into an image-sized buffer (last write wins = closest)
         idx_buffer = -np.ones((fh, fw), dtype=np.intp)
         idx_buffer[py_sorted, px_sorted] = ii_sorted
 
-        # A voxel is visible from this camera iff it is still recorded in the
-        # buffer at the pixel it projects to.
         visible_mask = idx_buffer[py[ii], px[ii]] == ii
         visible = ii[visible_mask]
 
